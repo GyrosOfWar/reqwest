@@ -127,6 +127,18 @@ struct ClientRef {
     auto_ungzip: AtomicBool,
 }
 
+#[cfg(feature="rustls")]
+fn new_hyper_client() -> ::Result<::hyper::Client> {
+    use hyper_rustls::TlsClient;
+    Ok(::hyper::Client::with_connector(
+        ::hyper::client::Pool::with_connector(
+            Default::default(),
+            ::hyper::net::HttpsConnector::new(TlsClient::new())
+        )
+    ))
+}
+
+#[cfg(all(feature="native-tls", not(feature="rustls")))]
 fn new_hyper_client() -> ::Result<::hyper::Client> {
     use hyper_native_tls::NativeTlsClient;
     Ok(::hyper::Client::with_connector(
@@ -138,7 +150,6 @@ fn new_hyper_client() -> ::Result<::hyper::Client> {
         )
     ))
 }
-
 
 /// A builder to construct the properties of a `Request`.
 pub struct RequestBuilder {

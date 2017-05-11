@@ -102,6 +102,9 @@ extern crate hyper;
 
 #[macro_use] extern crate log;
 extern crate libflate;
+#[cfg(feature="rustls")]
+extern crate hyper_rustls;
+#[cfg(feature="native-tls")]
 extern crate hyper_native_tls;
 extern crate serde;
 extern crate serde_json;
