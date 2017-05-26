@@ -1,5 +1,7 @@
 use std::fmt;
 
+use hyper::header::{Headers, Authorization, Cookie};
+
 use ::Url;
 
 /// A type that controls the policy on how to handle the following of redirects.
@@ -56,9 +58,11 @@ impl RedirectPolicy {
     ///
     /// # Example
     ///
-    /// ```no_run
-    /// # use reqwest::RedirectPolicy;
-    /// # let mut client = reqwest::Client::new().unwrap();
+    /// ```rust
+    /// # use reqwest::{Error, RedirectPolicy};
+    /// #
+    /// # fn run() -> Result<(), Error> {
+    /// let mut client = reqwest::Client::new()?;
     /// client.redirect(RedirectPolicy::custom(|attempt| {
     ///     if attempt.previous().len() > 5 {
     ///         attempt.too_many_redirects()
@@ -69,6 +73,8 @@ impl RedirectPolicy {
     ///         attempt.follow()
     ///     }
     /// }));
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn custom<T>(policy: T) -> RedirectPolicy
     where T: Fn(RedirectAttempt) -> RedirectAction + Send + Sync + 'static {
@@ -179,6 +185,19 @@ pub fn check_redirect(policy: &RedirectPolicy, next: &Url, previous: &[Url]) -> 
     }).inner
 }
 
+pub fn remove_sensitive_headers(headers: &mut Headers, next: &Url, previous: &[Url]) {
+    if let Some(previous) = previous.last() {
+        let cross_host = next.host_str() != previous.host_str()
+            || next.port_or_known_default() != previous.port_or_known_default();
+        if cross_host {
+            headers.remove::<Authorization<String>>();
+            headers.remove::<Cookie>();
+            headers.remove_raw("cookie2");
+            headers.remove_raw("www-authenticate");
+        }
+    }
+}
+
 /*
 This was the desired way of doing it, but ran in to inference issues when
 using closures, since the arguments received are references (&Url and &[Url]),
@@ -228,4 +247,32 @@ fn test_redirect_policy_custom() {
 
     let next = Url::parse("http://foo/baz").unwrap();
     assert_eq!(check_redirect(&policy, &next, &[]), Action::Stop);
+}
+
+#[test]
+fn test_remove_sensitive_headers() {
+    use hyper::header::Accept;
+
+    let mut headers = Headers::new();
+    headers.set(Accept::star());
+    headers.set(Authorization("let me in".to_owned()));
+    headers.set(
+        Cookie(vec![
+            String::from("foo=bar")
+        ])
+    );
+
+    let next  = Url::parse("http://initial-domain.com/path").unwrap();
+    let mut prev = vec![Url::parse("http://initial-domain.com/new_path").unwrap()];
+    let mut filtered_headers = headers.clone();
+
+    remove_sensitive_headers(&mut headers, &next, &prev);
+    assert_eq!(headers, filtered_headers);
+
+    prev.push(Url::parse("http://new-domain.com/path").unwrap());
+    filtered_headers.remove::<Authorization<String>>();
+    filtered_headers.remove::<Cookie>();
+
+    remove_sensitive_headers(&mut headers, &next, &prev);
+    assert_eq!(headers, filtered_headers);
 }

@@ -16,7 +16,7 @@ use serde_json;
 use serde_urlencoded;
 
 use ::body::{self, Body};
-use ::redirect::{self, RedirectPolicy, check_redirect};
+use ::redirect::{self, RedirectPolicy, check_redirect, remove_sensitive_headers};
 use ::response::Response;
 
 static DEFAULT_USER_AGENT: &'static str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
@@ -28,6 +28,20 @@ static DEFAULT_USER_AGENT: &'static str = concat!(env!("CARGO_PKG_NAME"), "/", e
 ///
 /// The `Client` holds a connection pool internally, so it is advised that
 /// you create one and reuse it.
+///
+/// # Examples
+///
+/// ```rust
+/// # use reqwest::{Error, Client};
+/// #
+/// # fn run() -> Result<(), Error> {
+/// let client = Client::new()?;
+/// let resp = client.get("http://httpbin.org/").send()?;
+/// #   drop(resp);
+/// #   Ok(())
+/// # }
+///
+/// ```
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<ClientRef>,
@@ -42,19 +56,31 @@ impl Client {
             inner: Arc::new(ClientRef {
                 hyper: RwLock::new(client),
                 redirect_policy: Mutex::new(RedirectPolicy::default()),
+                auto_referer: AtomicBool::new(true),
                 auto_ungzip: AtomicBool::new(true),
             }),
         })
     }
 
     /// Enable auto gzip decompression by checking the ContentEncoding response header.
+    ///
+    /// Default is enabled.
     pub fn gzip(&mut self, enable: bool) {
         self.inner.auto_ungzip.store(enable, Ordering::Relaxed);
     }
 
     /// Set a `RedirectPolicy` for this client.
+    ///
+    /// Default will follow redirects up to a maximum of 10.
     pub fn redirect(&mut self, policy: RedirectPolicy) {
         *self.inner.redirect_policy.lock().unwrap() = policy;
+    }
+
+    /// Enable or disable automatic setting of the `Referer` header.
+    ///
+    /// Default is `true`.
+    pub fn referer(&mut self, enable: bool) {
+        self.inner.auto_referer.store(enable, Ordering::Relaxed);
     }
 
     /// Set a timeout for both the read and write operations of a client.
@@ -116,6 +142,7 @@ impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Client")
             .field("redirect_policy", &self.inner.redirect_policy)
+            .field("referer", &self.inner.auto_referer)
             .field("auto_ungzip", &self.inner.auto_ungzip)
             .finish()
     }
@@ -124,6 +151,7 @@ impl fmt::Debug for Client {
 struct ClientRef {
     hyper: RwLock<::hyper::Client>,
     redirect_policy: Mutex<RedirectPolicy>,
+    auto_referer: AtomicBool,
     auto_ungzip: AtomicBool,
 }
 
@@ -166,13 +194,18 @@ pub struct RequestBuilder {
 impl RequestBuilder {
     /// Add a `Header` to this Request.
     ///
-    /// ```no_run
+    /// ```rust
+    /// # use reqwest::Error;
+    /// #
+    /// # fn run() -> Result<(), Error> {
     /// use reqwest::header::UserAgent;
-    /// let client = reqwest::Client::new().expect("client failed to construct");
+    /// let client = reqwest::Client::new()?;
     ///
     /// let res = client.get("https://www.rust-lang.org")
     ///     .header(UserAgent("foo".to_string()))
-    ///     .send();
+    ///     .send()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn header<H: ::header::Header + ::header::HeaderFormat>(mut self, header: H) -> RequestBuilder {
         self.headers.set(header);
@@ -206,15 +239,20 @@ impl RequestBuilder {
     /// and also sets the `Content-Type: application/www-form-url-encoded`
     /// header.
     ///
-    /// ```no_run
+    /// ```rust
+    /// # use reqwest::Error;
     /// # use std::collections::HashMap;
+    /// #
+    /// # fn run() -> Result<(), Error> {
     /// let mut params = HashMap::new();
     /// params.insert("lang", "rust");
     ///
-    /// let client = reqwest::Client::new().unwrap();
+    /// let client = reqwest::Client::new()?;
     /// let res = client.post("http://httpbin.org")
     ///     .form(&params)
-    ///     .send();
+    ///     .send()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn form<T: Serialize>(mut self, form: &T) -> RequestBuilder {
         let body = serde_urlencoded::to_string(form).map_err(::error::from);
@@ -228,15 +266,20 @@ impl RequestBuilder {
     /// Sets the body to the JSON serialization of the passed value, and
     /// also sets the `Content-Type: application/json` header.
     ///
-    /// ```no_run
+    /// ```rust
+    /// # use reqwest::Error;
     /// # use std::collections::HashMap;
+    /// #
+    /// # fn run() -> Result<(), Error> {
     /// let mut map = HashMap::new();
     /// map.insert("lang", "rust");
     ///
-    /// let client = reqwest::Client::new().unwrap();
+    /// let client = reqwest::Client::new()?;
     /// let res = client.post("http://httpbin.org")
     ///     .json(&map)
-    ///     .send();
+    ///     .send()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn json<T: Serialize>(mut self, json: &T) -> RequestBuilder {
         let body = serde_json::to_vec(json).expect("serde to_vec cannot fail");
@@ -321,9 +364,14 @@ impl RequestBuilder {
 
                 url = match loc {
                     Ok(loc) => {
-                        headers.set(Referer(url.to_string()));
+                        if client.auto_referer.load(Ordering::Relaxed) {
+                            if let Some(referer) = make_referer(&loc, &url) {
+                                headers.set(referer);
+                            }
+                        }
                         urls.push(url);
                         let action = check_redirect(&client.redirect_policy.lock().unwrap(), &loc, &urls);
+
                         match action {
                             redirect::Action::Follow => loc,
                             redirect::Action::Stop => {
@@ -345,9 +393,8 @@ impl RequestBuilder {
                     }
                 };
 
+                remove_sensitive_headers(&mut headers, &url, &urls);
                 debug!("redirecting to {:?} '{}'", method, url);
-
-                //TODO: removeSensitiveHeaders(&mut headers, &url);
             } else {
                 return Ok(::response::new(res, client.auto_ungzip.load(Ordering::Relaxed)))
             }
@@ -363,6 +410,18 @@ impl fmt::Debug for RequestBuilder {
             .field("headers", &self.headers)
             .finish()
     }
+}
+
+fn make_referer(next: &Url, previous: &Url) -> Option<Referer> {
+    if next.scheme() == "http" && previous.scheme() == "https" {
+        return None;
+    }
+
+    let mut referer = previous.clone();
+    let _ = referer.set_username("");
+    let _ = referer.set_password(None);
+    referer.set_fragment(None);
+    Some(Referer(referer.into_string()))
 }
 
 #[cfg(test)]
